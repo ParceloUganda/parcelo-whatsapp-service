@@ -1,0 +1,6 @@
+---
+description: 
+globs: .tsx,.ts
+alwaysApply: false
+---
+WHEN I REQUEST TO ADD A NEW COMPONENT / FEATURE, ALWAYS BEGIN BY LOOKING AT THE PAGE THEN ANALYSING. If the page already has too many lines of code and you've decided to create a new component always try and create a component in the components folder. Then once the component has been created simply import it. 

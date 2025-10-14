@@ -1,10 +1,13 @@
 """Chat message persistence utilities."""
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from services.supabase_client import get_supabase_client
+
+SENSITIVE_KEYS = {"contacts", "context", "metadata", "statuses", "errors", "customer"}
 
 
 async def message_exists(wa_message_id: str) -> bool:
@@ -58,7 +61,7 @@ async def insert_inbound_message(
             "text": text,
             "media_url": media_url,
             "media_mime_type": media_mime_type,
-            "payload": payload,
+            "payload": _sanitize_payload(payload),
             "wa_message_id": wa_message_id,
             "wa_status": wa_status,
             "wa_timestamp": wa_timestamp,
@@ -81,12 +84,12 @@ async def insert_outbound_message(
     text: str,
     wa_message_id: Optional[str],
     metadata: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Persist outbound chat message record."""
+) -> str:
+    """Persist outbound chat message record and return new id."""
 
     client = get_supabase_client()
 
-    def _insert() -> None:
+    def _insert() -> str:
         payload = {
             "session_id": session_id,
             "customer_id": customer_id,
@@ -96,8 +99,34 @@ async def insert_outbound_message(
             "wa_message_id": wa_message_id,
             "wa_status": "sent" if wa_message_id else "sent",
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "payload": metadata or {},
+            "payload": _sanitize_payload(metadata or {}),
         }
-        client.table("chat_messages").insert([payload]).execute()
+        response = client.table("chat_messages").insert(payload, returning="representation").execute()
+        data = response.data if response else None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not data or "id" not in data:
+            raise RuntimeError("chat message insert did not return id")
+        return data["id"]
 
-    await asyncio.to_thread(_insert)
+    return await asyncio.to_thread(_insert)
+
+
+def _sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove sensitive keys from payload while preserving structure."""
+
+    if not payload:
+        return {}
+
+    clone: Dict[str, Any] = deepcopy(payload)
+    for key in list(clone.keys()):
+        if key in SENSITIVE_KEYS:
+            clone.pop(key, None)
+        elif isinstance(clone[key], dict):
+            clone[key] = _sanitize_payload(clone[key])
+        elif isinstance(clone[key], list):
+            clone[key] = [
+                _sanitize_payload(item) if isinstance(item, dict) else item
+                for item in clone[key]
+            ]
+    return clone

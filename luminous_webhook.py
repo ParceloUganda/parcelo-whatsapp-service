@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+import json
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Request
 
 from services.agent_runner import run_agent_workflow
 from services.chat_service import (
@@ -29,34 +30,76 @@ from services.idempotency_service import (
     record_idempotency_key,
 )
 from services.luminous_client import send_whatsapp_message
+from services.media_service import (
+    MediaDownloadDisabled,
+    fetch_media_metadata,
+    download_media_to_storage,
+    process_caption_if_needed,
+    process_transcription_if_needed,
+    record_chat_media,
+)
 from services.session_service import (
     get_or_create_chat_session,
     update_session_last_message,
 )
+from services.embedding_service import generate_message_embedding
+from services.summarization_service import maybe_generate_summary
 from services.telegram_client import (
     notify_agent_error,
     notify_agent_response,
     notify_incoming_message,
 )
+from config import get_settings
 from utils.logging import get_logger
 
 
 router = APIRouter(prefix="/api/luminous", tags=["Luminous"])
 logger = get_logger(__name__)
+settings = get_settings()
+
+_session_locks: dict[str, asyncio.Lock] = {}
+_session_locks_guard = asyncio.Lock()
+
+
+def _serialize_for_log(value: Any, *, limit: int = 4000) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) > limit:
+        return f"{text[:limit]}...(truncated)"
+    return text
+
+
+EXAMPLE_WEBHOOK_PAYLOAD: Dict[str, Any] = {
+    "event": "message.received",
+    "data": {
+        "id": "sample-message-id",
+        "from": "+256700000000",
+        "messages": [
+            {
+                "id": "sample-message-id",
+                "from": "+256700000000",
+                "timestamp": "1700000000",
+                "type": "text",
+                "text": {"body": "Hello Parcelo!"},
+            }
+        ],
+    },
+    "timestamp": "2025-10-14T18:56:18Z",
+}
 
 
 @router.post("/webhook")
-async def luminous_webhook(request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+async def luminous_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any] = Body(..., example=EXAMPLE_WEBHOOK_PAYLOAD),
+) -> Dict[str, Any]:
     """Handle webhook events sent by Luminous."""
 
     headers = dict(request.headers)
     logger.info("Webhook invoked", extra={"headers": headers})
-
-    try:
-        payload: Dict[str, Any] = await request.json()
-    except Exception as exc:  # pragma: no cover - FastAPI handles JSON errors
-        logger.exception("Failed to parse webhook payload")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
     logger.debug("Webhook payload", extra={"payload": payload})
 
@@ -149,6 +192,17 @@ def normalize_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[
     return event, data, timestamp
 
 
+def _resolve_message_container(payload: Dict[str, Any]) -> Dict[str, Any]:
+    root = payload
+    if isinstance(root.get("body"), dict):
+        root = root["body"].get("data") or root["body"]
+    if isinstance(root, dict) and set(root.keys()) == {"data"}:
+        root = root.get("data")
+    if isinstance(root, dict) and {"value", "field"}.issubset(root.keys()):
+        root = root.get("value")
+    return root if isinstance(root, dict) else {}
+
+
 def build_idempotency_key(
     event: str,
     data: Dict[str, Any],
@@ -225,6 +279,15 @@ def extract_phone_number(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+async def _get_session_lock(session_id: str) -> asyncio.Lock:
+    async with _session_locks_guard:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _session_locks[session_id] = lock
+        return lock
+
+
 def resolve_event_type(event: str) -> str:
     if "status" in event:
         return "status"
@@ -252,55 +315,63 @@ class MessageData:
 
 
 def extract_message_data(data: Dict[str, Any]) -> MessageData:
-    message = data
-    if isinstance(data.get("messages"), list) and data["messages"]:
-        message = data["messages"][0]
-        if isinstance(data.get("contacts"), list) and data["contacts"]:
-            message["contact"] = data["contacts"][0]
+    message_container = _resolve_message_container(data)
+    message_list = message_container.get("messages")
+    message = message_list[0] if isinstance(message_list, list) and message_list else message_container
+
+    contacts = message_container.get("contacts")
+    if isinstance(contacts, list) and contacts:
+        message["contact"] = contacts[0]
 
     phone_number = (
         message.get("from")
+        or message_container.get("from")
         or message.get("phone")
         or message.get("phoneNumber")
         or message.get("phone_number")
-        or data.get("from")
+        or extract_phone_number(message_container)
     )
+    if phone_number and not str(phone_number).startswith("+"):
+        phone_number = f"+{str(phone_number).lstrip('+')}"
 
     message_text = (
         (message.get("text") or {}).get("body")
-        or (message.get("message") or {}).get("body")
-        or message.get("message")
-        or message.get("text")
+        or message.get("body")
+        or message.get("caption")
+        or (message.get("image") or {}).get("caption")
+        or (message.get("document") or {}).get("caption")
         or ""
     )
 
-    message_type = message.get("type") or message.get("message_type") or "text"
-    wa_message_id = (
-        message.get("id")
-        or message.get("message_id")
-        or message.get("messageId")
-        or message.get("wa_message_id")
-    )
+    message_type = message.get("type") or "text"
+    wa_message_id = message.get("id")
 
     wa_timestamp = parse_timestamp(
         message.get("timestamp")
-        or message.get("created_at")
-        or data.get("timestamp")
+        or message_container.get("timestamp")
     )
 
     contact = message.get("contact", {}) if isinstance(message, dict) else {}
     contact_name = (
         contact.get("profile", {}).get("name")
         or contact.get("name")
-        or data.get("contact", {}).get("name")
         or "Customer"
     )
 
     media_url = None
     media_mime_type = None
     if message_type == "image" and message.get("image"):
-        media_url = message["image"].get("link")
+        media_url = message["image"].get("url") or message["image"].get("link")
         media_mime_type = message["image"].get("mime_type")
+    elif message_type == "audio" and message.get("audio"):
+        media_url = message["audio"].get("url")
+        media_mime_type = message["audio"].get("mime_type")
+    elif message_type == "video" and message.get("video"):
+        media_url = message["video"].get("url")
+        media_mime_type = message["video"].get("mime_type")
+    elif message_type == "document" and message.get("document"):
+        media_url = message["document"].get("url")
+        media_mime_type = message["document"].get("mime_type")
 
     return MessageData(
         phone_number=phone_number,
@@ -333,6 +404,26 @@ async def handle_message_received(
     precomputed_message: Optional[MessageData] = None,
 ) -> None:
     message_data = precomputed_message or extract_message_data(data)
+    logger.info(
+        "Inbound message parsed %s",
+        _serialize_for_log(
+            {
+                "wa_message_id": message_data.wa_message_id,
+                "phone_number": message_data.phone_number,
+                "message_type": message_data.message_type,
+                "has_media_url": bool(message_data.media_url),
+                "raw_message_keys": list(data.keys()) if isinstance(data, dict) else None,
+            }
+        ),
+    )
+    if message_data.message_type != "text":
+        logger.debug(
+            "Inbound raw payload %s",
+            _serialize_for_log({
+                "wa_message_id": message_data.wa_message_id,
+                "payload": data,
+            }),
+        )
 
     if not message_data.phone_number or not message_data.wa_message_id:
         logger.error("Missing phone or message ID", extra={"data": data})
@@ -362,7 +453,7 @@ async def handle_message_received(
 
     session = await get_or_create_chat_session(customer["customer_id"], message_data.phone_number)
 
-    await insert_inbound_message(
+    message_id = await insert_inbound_message(
         session_id=session["id"],
         customer_id=customer["customer_id"],
         message_type=message_data.message_type,
@@ -375,7 +466,27 @@ async def handle_message_received(
         media_mime_type=message_data.media_mime_type,
     )
 
-    await update_session_last_message(session["id"])
+    await update_session_last_message(
+        session["id"],
+        direction="inbound",
+        phone_number=message_data.phone_number,
+    )
+
+    background_tasks.add_task(
+        generate_message_embedding,
+        message_id,
+        message_data.message_text,
+    )
+    background_tasks.add_task(maybe_generate_summary, session["id"])
+
+    if settings.enable_media_download and message_data.message_type in {"image", "audio", "document"}:
+        background_tasks.add_task(
+            process_media_message,
+            message_id=message_id,
+            message_type=message_data.message_type,
+            wa_media_id=_extract_media_id(data),
+            mime_type=message_data.media_mime_type,
+        )
 
     background_tasks.add_task(
         process_with_agent,
@@ -395,33 +506,167 @@ async def process_with_agent(
     customer_name: str,
     message_text: str,
 ) -> None:
+    lock = await _get_session_lock(session_id)
+    if lock.locked():
+        logger.info(
+            "Waiting for session lock",
+            extra={"session_id": session_id, "customer_id": customer_id},
+        )
+
+    async with lock:
+        logger.debug(
+            "Session lock acquired",
+            extra={"session_id": session_id, "customer_id": customer_id},
+        )
+        try:
+            agent_output = await run_agent_workflow(
+                message_text=message_text,
+                customer_id=customer_id,
+                session_id=session_id,
+                phone_number=phone_number,
+                customer_name=customer_name,
+            )
+            response_text = agent_output.get("response_text") or "Thank you for your message."
+
+            send_result = await send_whatsapp_message(phone_number, response_text)
+            wa_message_id = send_result.get("message_id")
+
+            message_id = await insert_outbound_message(
+                session_id=session_id,
+                customer_id=customer_id,
+                text=response_text,
+                wa_message_id=wa_message_id,
+                metadata={"agent": agent_output},
+            )
+
+            await update_session_last_message(session_id, direction="outbound")
+
+            # Schedule embedding and summary updates
+            await asyncio.gather(
+                generate_message_embedding(message_id, response_text),
+                maybe_generate_summary(session_id),
+            )
+
+            await notify_agent_response(
+                phone_number,
+                response_text,
+                agent_output.get("intent"),
+                customer_name,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            logger.exception("Agent processing failed")
+            await notify_agent_error(phone_number, message_text, str(exc), customer_name)
+        finally:
+            logger.debug(
+                "Session lock released",
+                extra={"session_id": session_id, "customer_id": customer_id},
+            )
+
+
+async def process_media_message(
+    *,
+    message_id: str,
+    message_type: str,
+    wa_media_id: Optional[str],
+    mime_type: Optional[str],
+) -> None:
+    if not wa_media_id:
+        logger.warning("Missing wa_media_id for media message", extra={"message_id": message_id})
+        return
+
     try:
-        agent_output = await run_agent_workflow(
-            message_text=message_text,
-            customer_id=customer_id,
-            session_id=session_id,
-            phone_number=phone_number,
-            customer_name=customer_name,
+        metadata = await fetch_media_metadata(wa_media_id)
+        logger.info(
+            "Fetched media metadata %s",
+            _serialize_for_log(
+                {
+                    "message_id": message_id,
+                    "wa_media_id": wa_media_id,
+                    "metadata": metadata,
+                }
+            ),
         )
-        response_text = agent_output.get("response_text") or "Thank you for your message."
+    except MediaDownloadDisabled:
+        logger.debug("Media download disabled; skipping", extra={"message_id": message_id})
+        return
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Failed to fetch media metadata", extra={"wa_media_id": wa_media_id})
+        return
 
-        send_result = await send_whatsapp_message(phone_number, response_text)
-        wa_message_id = send_result.get("message_id")
-
-        await insert_outbound_message(
-            session_id=session_id,
-            customer_id=customer_id,
-            text=response_text,
-            wa_message_id=wa_message_id,
-            metadata={"agent": agent_output},
+    if not metadata:
+        logger.warning(
+            "Missing metadata for media %s",
+            _serialize_for_log({"message_id": message_id, "wa_media_id": wa_media_id}),
         )
+        return
 
-        await notify_agent_response(
-            phone_number,
-            response_text,
-            agent_output.get("intent"),
-            customer_name,
+    download_url = metadata.get("url")
+    resolved_mime_type = metadata.get("mime_type") or mime_type or "application/octet-stream"
+
+    try:
+        result = await download_media_to_storage(
+            message_id=message_id,
+            wa_media_id=wa_media_id,
+            download_url=download_url,
+            mime_type=resolved_mime_type,
         )
-    except Exception as exc:  # pragma: no cover - defensive guard
-        logger.exception("Agent processing failed")
-        await notify_agent_error(phone_number, message_text, str(exc), customer_name)
+        logger.info(
+            "Media download result %s",
+            _serialize_for_log(
+                {
+                    "message_id": message_id,
+                    "wa_media_id": wa_media_id,
+                    "mime_type": resolved_mime_type,
+                    "downloaded": bool(result),
+                }
+            ),
+        )
+    except MediaDownloadDisabled:
+        logger.debug("Media download disabled mid-process", extra={"message_id": message_id})
+        return
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Media download failed", extra={"wa_media_id": wa_media_id})
+        return
+
+    if not result:
+        return
+
+    caption: Optional[str] = None
+    transcript: Optional[str] = None
+
+    try:
+        caption = await process_caption_if_needed(result)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Image captioning step failed", extra={"message_id": message_id})
+
+    try:
+        transcript = await process_transcription_if_needed(result)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Audio transcription step failed", extra={"message_id": message_id})
+
+    await record_chat_media(result, caption=caption, transcript=transcript)
+
+
+def _extract_media_id(data: Dict[str, Any]) -> Optional[str]:
+    container = _resolve_message_container(data)
+    message = container
+    if isinstance(container.get("messages"), list) and container["messages"]:
+        message = container["messages"][0]
+    else:
+        message = container
+
+    if isinstance(message, dict):
+        for key in ("image", "audio", "video", "document"):
+            media = message.get(key)
+            if isinstance(media, dict):
+                media_id = media.get("id")
+                if media_id:
+                    return media_id
+    if isinstance(container.get("messages"), list):
+        for entry in container["messages"]:
+            if isinstance(entry, dict):
+                for key in ("image", "audio", "video", "document"):
+                    media = entry.get(key)
+                    if isinstance(media, dict) and media.get("id"):
+                        return media.get("id")
+    return None
