@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     supabase_service_role_key: str
     luminous_api_url: str
     luminous_api_key: str
+    
+    # Next.js integration for magic link authentication
+    nextjs_api_url: str = "https://parceloug.com"
+    service_secret: str = ""
 
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None

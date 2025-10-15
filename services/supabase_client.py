@@ -12,4 +12,17 @@ def get_supabase_client() -> Client:
     """Return cached Supabase client."""
 
     settings = get_settings()
-    return create_client(settings.supabase_url, settings.supabase_service_role_key)
+    
+    # Create client with proper headers for PostgREST
+    options = {
+        "headers": {
+            "accept-profile": "public",
+            "content-profile": "public",
+        }
+    }
+    
+    return create_client(
+        settings.supabase_url, 
+        settings.supabase_service_role_key,
+        options=options
+    )
