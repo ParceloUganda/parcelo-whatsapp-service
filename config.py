@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     # Core environment
     environment: str = "development"
-    log_level: str = "DEBUG"
+    log_level: str = "INFO"
 
     # External services
     openai_api_key: str
