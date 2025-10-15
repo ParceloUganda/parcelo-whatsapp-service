@@ -3,6 +3,7 @@
 from functools import lru_cache
 
 from supabase import Client, create_client
+from supabase.lib.client_options import ClientOptions
 
 from config import get_settings
 
@@ -14,12 +15,12 @@ def get_supabase_client() -> Client:
     settings = get_settings()
     
     # Create client with proper headers for PostgREST
-    options = {
-        "headers": {
+    options = ClientOptions(
+        headers={
             "accept-profile": "public",
             "content-profile": "public",
         }
-    }
+    )
     
     return create_client(
         settings.supabase_url, 
