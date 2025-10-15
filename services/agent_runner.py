@@ -32,7 +32,12 @@ from utils.logging import get_logger
 
 settings = get_settings()
 logger = get_logger(__name__)
-client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+# Create OpenAI client with HTTP/1.1 to avoid HTTP/2 streaming issues
+client = AsyncOpenAI(
+    api_key=settings.openai_api_key,
+    http_client=httpx.AsyncClient(http2=False)
+)
 encoding = tiktoken.get_encoding("cl100k_base")
 
 set_default_openai_key(settings.openai_api_key)
