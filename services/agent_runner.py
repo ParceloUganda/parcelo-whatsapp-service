@@ -1,11 +1,27 @@
-"""Simple OpenAI-powered agent workflow with sliding window context."""
+"""Task-specific multi-agent orchestration for Parcelo WhatsApp assistant."""
+
+from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from enum import Enum
+import json
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import tiktoken
+from agents import (
+    Agent,
+    ModelSettings,
+    Runner,
+    RunConfig,
+    TResponseInputItem,
+    function_tool,
+    set_default_openai_key,
+)
 from openai import AsyncOpenAI
+from openai.types.shared.reasoning import Reasoning
+from pydantic import BaseModel, Field
 
 from config import get_settings
 from services.embedding_service import fetch_session_recall
@@ -18,18 +34,340 @@ logger = get_logger(__name__)
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 encoding = tiktoken.get_encoding("cl100k_base")
 
+set_default_openai_key(settings.openai_api_key)
+
 WINDOW_SIZE = max(settings.llm_window_size, 1)
 MAX_PROMPT_TOKENS = max(settings.llm_max_prompt_tokens, 1024)
-OUTPUT_BUFFER_TOKENS = max(settings.llm_output_buffer_tokens, 128)
+
+
+class AgentRoute(str, Enum):
+    QUOTATION = "quotation"
+    WISHLIST = "wishlist"
+    PAYMENTS = "payments"
+    ORDERS = "orders"
+    ESCALATION = "escalation"
+    SHIPPING = "shipping"
+    GENERAL = "general"
+    UNSAFE = "unsafe"
+
+
+class ClassifierOutput(BaseModel):
+    route: AgentRoute = Field(description="Selected downstream agent")
+    reasoning: Optional[str] = Field(default=None, description="Brief rationale for routing decision")
+
+
+class QuotationOutput(BaseModel):
+    tool: str = Field(description="Tool to invoke, e.g. CreateQuotation or GetQuotation")
+    action: str = Field(description="Action or sub-command for the tool")
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    response_text: str = Field(description="Customer-facing reply")
+
+
+class WishlistOutput(BaseModel):
+    tool: str
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    response_text: str
+
+
+class PaymentsOutput(BaseModel):
+    tool: str
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    response_text: str
+
+
+class OrdersOutput(BaseModel):
+    tool: str
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    response_text: str
+
+
+class EscalationOutput(BaseModel):
+    escalate: bool
+    tool: Optional[str] = Field(default=None, description="Tool used to escalate, if any")
+    reason: str
+    response_text: str
+
+
+class ShippingOutput(BaseModel):
+    tool: str
+    action: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    response_text: str
 
 BASE_SYSTEM_PROMPT = (
     "You are ParceloBot, a helpful WhatsApp assistant for Parcelo Uganda. "
     "Provide concise, friendly answers. Offer to help with price quotes, order tracking, payments, "
     "and general questions. Keep tone warm and professional. Please don't repeat the person's names and number or what you do. "
-    " Avoid informal language or tone."
-    "You will want to have a personality that is friendly but professional."
-    "Avoid any mention of AI agent being used at parcelo please"
+    "Avoid informal language or tone. You have a professional yet friendly personality. "
+    "Avoid any mention of AI agent being used at Parcelo."
 )
+
+
+def _tool(name: str, description: str):
+    return function_tool(
+        name_override=name,
+        description_override=description,
+        strict_mode=False,
+    )
+
+
+def _build_agent(
+    *,
+    name: str,
+    instructions: str,
+    model: str,
+    output_type: Optional[type[BaseModel]] = None,
+    reasoning_effort: Optional[str] = None,
+    tools: Optional[List[Any]] = None,
+) -> Agent:
+    settings_kwargs = {
+        "store": True,
+    }
+    if reasoning_effort:
+        settings_kwargs["reasoning"] = Reasoning(effort=reasoning_effort)
+
+    return Agent(
+        name=name,
+        instructions=instructions,
+        model=model,
+        output_type=output_type,
+        model_settings=ModelSettings(**settings_kwargs),
+        tools=list(tools) if tools else [],
+    )
+
+
+@_tool("CreateQuotation", "Create a new parcel quotation")
+def create_quotation_tool(
+    customer_id: str,
+    items: List[Dict[str, Any]],
+    notes: Optional[str] = None,
+) -> str:
+    payload = {"customer_id": customer_id, "items": items, "notes": notes}
+    logger.info("CreateQuotation tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("GetQuotation", "Retrieve quotation details")
+def get_quotation_tool(quote_id: Optional[str] = None, quote_link: Optional[str] = None) -> str:
+    payload = {"quote_id": quote_id, "quote_link": quote_link}
+    logger.info("GetQuotation tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("WishlistCRUD", "Manage wishlist items")
+def wishlist_crud_tool(
+    customer_id: str,
+    action: str,
+    item: Optional[Dict[str, Any]] = None,
+) -> str:
+    payload = {"customer_id": customer_id, "action": action, "item": item}
+    logger.info("WishlistCRUD tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("MoveWishlistToCart", "Move wishlist items to cart")
+def move_wishlist_to_cart_tool(
+    customer_id: str,
+    wishlist_item_ids: List[str],
+) -> str:
+    payload = {"customer_id": customer_id, "wishlist_item_ids": wishlist_item_ids}
+    logger.info("MoveWishlistToCart tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("CartCRUD", "Manage cart items")
+def cart_crud_tool(
+    customer_id: str,
+    action: str,
+    item: Optional[Dict[str, Any]] = None,
+) -> str:
+    payload = {"customer_id": customer_id, "action": action, "item": item}
+    logger.info("CartCRUD tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("CreatePaymentIntent", "Create a payment intent")
+def create_payment_intent_tool(
+    order_or_quote_id: str,
+    amount: float,
+    currency: str,
+    method: str,
+) -> str:
+    payload = {
+        "order_or_quote_id": order_or_quote_id,
+        "amount": amount,
+        "currency": currency,
+        "method": method,
+    }
+    logger.info("CreatePaymentIntent tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("GetPaymentStatus", "Check payment status")
+def get_payment_status_tool(payment_id: str) -> str:
+    payload = {"payment_id": payment_id}
+    logger.info("GetPaymentStatus tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("CreateTicket", "Open a support ticket")
+def create_ticket_tool(
+    customer_id: str,
+    topic: str,
+    message: str,
+    files: Optional[List[str]] = None,
+) -> str:
+    payload = {
+        "customer_id": customer_id,
+        "topic": topic,
+        "message": message,
+        "files": files,
+    }
+    logger.info("CreateTicket tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("ReplyTicket", "Reply to a support ticket")
+def reply_ticket_tool(
+    ticket_id: str,
+    message: str,
+    files: Optional[List[str]] = None,
+) -> str:
+    payload = {"ticket_id": ticket_id, "message": message, "files": files}
+    logger.info("ReplyTicket tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("EscalateIssue", "Escalate issue to human agent")
+def escalate_issue_tool(
+    ticket_id: str,
+    reason_code: str,
+    priority: str,
+) -> str:
+    payload = {"ticket_id": ticket_id, "reason_code": reason_code, "priority": priority}
+    logger.info("EscalateIssue tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+@_tool("TrackShipment", "Track shipment status")
+def track_shipment_tool(
+    parcel_id: Optional[str] = None,
+    order_id: Optional[str] = None,
+) -> str:
+    payload = {"parcel_id": parcel_id, "order_id": order_id}
+    logger.info("TrackShipment tool invoked", extra={"payload": payload})
+    return json.dumps({"status": "pending", "payload": payload})
+
+
+classifier_agent = _build_agent(
+    name="Classifier Agent",
+    instructions=(
+        "Read the most recent customer message and classify the intent. "
+        "Return one of: quotation, wishlist, payments, orders, escalation, shipping, general, unsafe. "
+        "Classify as unsafe if the user asks for disallowed content or the request must be escalated."
+    ),
+    model="gpt-5-nano",
+    output_type=ClassifierOutput,
+    reasoning_effort="low",
+)
+
+quotation_agent = _build_agent(
+    name="Quotation Agent",
+    instructions=(
+        "Assist with Parcelo quotation workflows. Determine if the customer wants a new quote or information about an existing quote. "
+        "Use the provided tools abstractly (CreateQuotation, GetQuotation) and prepare a response summarizing next steps. "
+        "Collect pickup, drop-off, parcel details, and service level when needed."
+    ),
+    model="gpt-5-nano",
+    output_type=QuotationOutput,
+    reasoning_effort="low",
+    tools=[create_quotation_tool, get_quotation_tool],
+)
+
+
+wishlist_agent = _build_agent(
+    name="Wishlist & Cart Agent",
+    instructions=(
+        "Handle wishlist and cart management. Determine if the user wants to add/remove/list wishlist items, move to cart, or modify cart items. "
+        "Map the intent to actions for WishlistCRUD, MoveWishlistToCart, or CartCRUD tools. "
+        "Always respond with a clear confirmation and next steps."
+    ),
+    model="gpt-5-nano",
+    output_type=WishlistOutput,
+    reasoning_effort="low",
+    tools=[wishlist_crud_tool, move_wishlist_to_cart_tool, cart_crud_tool],
+)
+
+payments_agent = _build_agent(
+    name="Payments Agent",
+    instructions=(
+        "Help customers initiate or check payments. Determine whether to create a payment intent or fetch payment status via available tools. "
+        "Gather payment amount, method, and order details when necessary."
+    ),
+    model="gpt-5-nano",
+    output_type=PaymentsOutput,
+    reasoning_effort="low",
+    tools=[create_payment_intent_tool, get_payment_status_tool],
+)
+
+orders_agent = _build_agent(
+    name="Orders & Support Agent",
+    instructions=(
+        "Support order-related questions and basic support. Open or reply to support tickets or answer simple order status questions. "
+        "Decide between CreateTicket, ReplyTicket, or providing informational answers."
+    ),
+    model="gpt-5-nano",
+    output_type=OrdersOutput,
+    reasoning_effort="low",
+    tools=[create_ticket_tool, reply_ticket_tool],
+)
+
+escalation_agent = _build_agent(
+    name="Escalation Agent",
+    instructions=(
+        "Determine whether the issue should be handed over to a human Parcelo agent in Uganda. "
+        "If escalation is needed, include the reason and suggested human follow-up actions."
+    ),
+    model="gpt-5-nano",
+    output_type=EscalationOutput,
+    reasoning_effort="low",
+    tools=[escalate_issue_tool],
+)
+
+shipping_agent = _build_agent(
+    name="Shipping Agent",
+    instructions=(
+        "Provide shipment tracking assistance. Use the TrackShipment tool conceptually to fetch status and explain it clearly. "
+        "Ask for tracking numbers if missing."
+    ),
+    model="gpt-5-nano",
+    output_type=ShippingOutput,
+    reasoning_effort="low",
+    tools=[track_shipment_tool],
+)
+
+general_agent = _build_agent(
+    name="General Assistant",
+    instructions=(
+        "Handle general inquiries about Parcelo services, operating hours, contact options, or friendly greetings. "
+        "If information is missing, politely request it."
+    ),
+    model="gpt-5-nano",
+    reasoning_effort="low",
+)
+
+
+@dataclass
+class AgentResult:
+    route: AgentRoute
+    response_text: str
+    action: Optional[str] = None
+    payload: Dict[str, Any] = None
+    metadata: Dict[str, Any] = None
+    tool: Optional[str] = None
 
 
 async def run_agent_workflow(
@@ -40,7 +378,7 @@ async def run_agent_workflow(
     phone_number: str,
     customer_name: str | None = None,
 ) -> Dict[str, Any]:
-    """Run a conversational agent call with cached summary and sliding window context."""
+    """Route message through classifier and specialised agents."""
 
     messages, token_usage = await build_prompt_messages(
         session_id=session_id,
@@ -49,43 +387,131 @@ async def run_agent_workflow(
         latest_user_text=message_text,
     )
 
-    # Ensure the final user message is current even if cached context missed it
-    appended_user = {
-        "role": "user",
-        "content": format_user_context(
-            customer_name=customer_name,
-            phone_number=phone_number,
-            message_text=message_text,
+    conversation_history: List[TResponseInputItem] = [
+        {
+            "role": msg["role"],
+            "content": [
+                {
+                    "type": "output_text" if msg["role"] == "assistant" else "input_text",
+                    "text": msg["content"],
+                }
+            ],
+        }
+        for msg in messages
+    ]
+
+    classifier_result = await Runner.run(
+        classifier_agent,
+        input=_append_user_utterance(conversation_history, message_text),
+        run_config=_build_run_config("classifier"),
+    )
+
+    conversation_history.extend(item.to_input_item() for item in classifier_result.new_items)
+    parsed_classifier = classifier_result.final_output.model_dump()
+    route = AgentRoute(parsed_classifier["route"])
+
+    if route == AgentRoute.UNSAFE:
+        return _format_result(
+            AgentResult(
+                route=route,
+                response_text=(
+                    "I’m sorry, but I can’t help with that request. Let me know if there’s something else I can assist with."
+                ),
+            ),
+            token_usage,
+        )
+
+    agent = _select_agent(route)
+    agent_result = await Runner.run(
+        agent,
+        input=_append_user_utterance(conversation_history, message_text),
+        run_config=_build_run_config(route.value),
+    )
+    conversation_history.extend(item.to_input_item() for item in agent_result.new_items)
+
+    agent_output = agent_result.final_output
+    response_text = getattr(agent_output, "response_text", None) or agent_result.final_output_as(str)
+    action = getattr(agent_output, "action", None)
+    payload = getattr(agent_output, "payload", None)
+    tool = getattr(agent_output, "tool", None)
+
+    return _format_result(
+        AgentResult(
+            route=route,
+            response_text=response_text,
+            action=action,
+            payload=payload,
+            metadata={
+                "classifier_reasoning": parsed_classifier.get("reasoning"),
+                "agent_name": agent.name,
+            },
+            tool=tool,
         ),
+        token_usage,
+    )
+
+
+def _append_user_utterance(
+    history: Sequence[TResponseInputItem], message_text: str
+) -> List[TResponseInputItem]:
+    augmented = list(history)
+    if augmented:
+        last = augmented[-1]
+        if (
+            last.get("role") == "user"
+            and isinstance(last.get("content"), list)
+            and last["content"]
+        ):
+            last_part = last["content"][0]
+            if (
+                isinstance(last_part, dict)
+                and last_part.get("type") == "input_text"
+                and last_part.get("text") == message_text
+            ):
+                return augmented
+    augmented.append(
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": message_text}],
+        }
+    )
+    return augmented
+
+
+def _build_run_config(agent_label: str) -> RunConfig:
+    return RunConfig(
+        trace_metadata={
+            "__trace_source__": "agent_runner",
+            "agent": agent_label,
+        }
+    )
+
+
+def _select_agent(route: AgentRoute) -> Agent:
+    mapping = {
+        AgentRoute.QUOTATION: quotation_agent,
+        AgentRoute.WISHLIST: wishlist_agent,
+        AgentRoute.PAYMENTS: payments_agent,
+        AgentRoute.ORDERS: orders_agent,
+        AgentRoute.ESCALATION: escalation_agent,
+        AgentRoute.SHIPPING: shipping_agent,
+        AgentRoute.GENERAL: general_agent,
     }
-    if not messages or messages[-1]["role"] != "user":
-        messages.append(appended_user)
-    else:
-        messages[-1] = appended_user
+    return mapping.get(route, general_agent)
 
-    try:
-        response = await client.chat.completions.create(
-            model="gpt-5-nano",
-            messages=messages,
-            # max_tokens=MAX_PROMPT_TOKENS + OUTPUT_BUFFER_TOKENS,
-       
-        )
-        reply = response.choices[0].message.content if response.choices else ""
-    except Exception as exc:  # pragma: no cover - network failure safeguard
-        logger.exception("OpenAI agent call failed")
-        reply = (
-            "I'm sorry, I'm having trouble responding right now. Please try again in a moment or "
-            "type 'agent' to talk with a human."
-        )
 
+def _format_result(result: AgentResult, token_usage: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "intent": "general",
-        "response_text": reply.strip() or "Thank you for your message!",
-        "action": None,
+        "intent": result.route.value,
+        "response_text": result.response_text.strip() or "Thank you for your message!",
+        "action": result.action,
         "metadata": {
-            "model": "gpt-5-nano",
-            "customer_id": customer_id,
-            "session_id": session_id,
+            "model": "multi-agent",
+            "payload": result.payload,
+            "route": result.route.value,
+            "classifier_reason": (result.metadata or {}).get("classifier_reasoning"),
+            "agent_name": (result.metadata or {}).get("agent_name"),
+            "tool": result.tool,
             "prompt_tokens": token_usage.get("prompt_tokens"),
             "window_size": token_usage.get("window_size"),
             "summary_included": token_usage.get("summary_included"),
@@ -115,8 +541,10 @@ async def build_prompt_messages(
 
     messages: List[Dict[str, str]] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
     summary_included = False
+    summary_message: Optional[Dict[str, str]] = None
     if summary_text:
-        messages.append({"role": "system", "content": f"Conversation summary:\n{summary_text}"})
+        summary_message = {"role": "system", "content": f"Conversation summary:\n{summary_text}"}
+        messages.append(summary_message)
         summary_included = True
 
     recall_messages: List[Dict[str, str]] = []
@@ -142,9 +570,9 @@ async def build_prompt_messages(
         if content:
             messages.append({"role": role, "content": content})
 
-    recall_indices = [idx for idx, msg in enumerate(messages) if msg in recall_messages]
-    prompt_tokens = _ensure_token_budget(messages, recall_indices)
-    recall_included = any(idx < len(messages) and messages[idx] in recall_messages for idx in recall_indices)
+    prompt_tokens, summary_included, recall_included = _ensure_token_budget(
+        messages, recall_messages, summary_message
+    )
 
     return messages, {
         "prompt_tokens": prompt_tokens,
@@ -247,23 +675,45 @@ def _count_tokens(messages: List[Dict[str, str]]) -> int:
     return total
 
 
-def _ensure_token_budget(messages: List[Dict[str, str]], recall_indices: List[int]) -> int:
+def _ensure_token_budget(
+    messages: List[Dict[str, str]],
+    recall_messages: Sequence[Dict[str, str]],
+    summary_message: Optional[Dict[str, str]],
+) -> Tuple[int, bool, bool]:
     prompt_tokens = _count_tokens(messages)
 
     if prompt_tokens <= MAX_PROMPT_TOKENS:
-        return prompt_tokens
+        summary_included = summary_message in messages if summary_message else False
+        recall_included = any(msg in messages for msg in recall_messages)
+        return prompt_tokens, summary_included, recall_included
 
-    # Drop recall messages first if needed
-    for idx in reversed(recall_indices):
-        if idx < len(messages):
-            messages.pop(idx)
-
-        prompt_tokens = _count_tokens(messages)
-        if prompt_tokens <= MAX_PROMPT_TOKENS:
-            return prompt_tokens
+    def _pop_matching(predicate, *, reverse: bool) -> bool:
+        indices = range(len(messages) - 1, -1, -1) if reverse else range(len(messages))
+        for idx in indices:
+            if predicate(messages[idx], idx):
+                messages.pop(idx)
+                return True
+        return False
 
     while prompt_tokens > MAX_PROMPT_TOKENS and len(messages) > 1:
-        messages.pop(1)
+        removed = False
+
+        # Prefer removing recall messages first as they are auxiliary.
+        removed = _pop_matching(lambda msg, _: msg in recall_messages, reverse=True)
+
+        if not removed:
+            def _candidate(msg: Dict[str, str], idx: int) -> bool:
+                if idx == 0:
+                    return False
+                if summary_message is not None and msg is summary_message:
+                    return False
+                return True
+
+            removed = _pop_matching(_candidate, reverse=False)
+
+        if not removed:
+            break
+
         prompt_tokens = _count_tokens(messages)
 
     if prompt_tokens > MAX_PROMPT_TOKENS:
@@ -275,7 +725,9 @@ def _ensure_token_budget(messages: List[Dict[str, str]], recall_indices: List[in
             },
         )
 
-    return prompt_tokens
+    summary_included = summary_message in messages if summary_message else False
+    recall_included = any(msg in messages for msg in recall_messages)
+    return prompt_tokens, summary_included, recall_included
 
 
 def _format_recall_rows(rows: List[Dict[str, Any]]) -> str:
